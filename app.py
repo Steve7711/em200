@@ -1818,6 +1818,40 @@ async function ensureDefaultCached(){
 
 
 function pad2(n){ return String(n).padStart(2,'0'); }
+
+  /* ✅ 新增复制js */
+async function copyToClipboard(text){
+  try{
+    await navigator.clipboard.writeText(text);
+    return true;
+  }catch(_){
+    // fallback
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try{
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      return true;
+    }catch(e){
+      document.body.removeChild(ta);
+      return false;
+    }
+  }
+}
+
+async function copyShowid(showid){
+  const ok = await copyToClipboard(String(showid));
+  if(ok){
+    showToast({ type:'success', title:'已复制', msg:`showid=${escapeHtml(showid)}`, duration: 1200 });
+  }else{
+    showToast({ type:'error', title:'复制失败', msg:'浏览器权限或安全策略阻止复制', duration: 2600 });
+  }
+}
+
   /* ✅ 新增备注js */
 function getNote(showid){
   try{
@@ -1917,7 +1951,18 @@ function renderPlayerCard(p, {showSelect=true, showUnlock=true}={}){
       <div class="p-sub">
         <span class="pill">
           <span style="color:rgba(108,168,255,.95); font-weight:900;">showid:</span>
-          <span style="font-weight:950; font-size:14px; color:rgba(234,240,255,.98);">${showid}</span>
+<span
+  ondblclick="copyShowid('${showid}')"
+  style="
+    font-weight:950;
+    font-size:14px;
+    color:rgba(234,240,255,.98);
+    cursor: copy;
+    text-decoration: underline;
+    text-decoration-color: rgba(108,168,255,.35);
+    text-underline-offset: 2px;
+  "
+>${showid}</span>
         </span>
         <span class="pill">
           <span style="color:rgba(50,255,155,.92); font-weight:900;">uuid:</span>
