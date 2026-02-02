@@ -5,6 +5,7 @@ import base64
 import threading
 from datetime import datetime, timedelta, timezone
 from collections import deque, OrderedDict
+import json
 
 import requests
 import ddddocr
@@ -408,11 +409,84 @@ def get_clubctx():
 
 # =========================
 # 玩家资料缓存（showid -> {showid, uuid, strNick, strCover, cached_at}）
-# 说明：内存缓存，Render 重启会丢失（符合你现阶段诉求）
+# 目标：
+# - 缓存一旦写入就一直保留：即便 Render 重启/重新部署，只要有持久化磁盘（或浏览器本地缓存回灌）就能恢复
+# - 支持单条删除
+#
+# 说明：
+# - 服务端：可选写入 USERCACHE_FILE（建议 Render 挂载 Persistent Disk，并把 USERCACHE_FILE 指到 /var/data/usercache.json）
+# - 前端：会把 showid 列表存到 localStorage，后端缓存为空时会自动回灌（同一浏览器/设备可跨部署恢复）
 # =========================
 USERCACHE_LOCK = threading.Lock()
 USERCACHE_MAX = 200
-USERCACHE = OrderedDict()  # showid -> dict
+USERCACHE = OrderedDict()  # showid -> dict（插入顺序=从旧到新）
+
+# 是否启用服务端落盘
+USERCACHE_PERSIST = (os.getenv("USERCACHE_PERSIST", "1").strip().lower() not in ("0", "false", "no"))
+USERCACHE_FILE = os.getenv("USERCACHE_FILE", os.path.join(BASE_DIR, "data", "usercache.json"))
+USERCACHE_FILE = os.path.abspath(USERCACHE_FILE)
+
+
+def _safe_mkdir(p: str):
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _save_usercache_to_disk():
+    if not USERCACHE_PERSIST:
+        return
+    try:
+        _safe_mkdir(os.path.dirname(USERCACHE_FILE))
+        with USERCACHE_LOCK:
+            items = list(USERCACHE.values())
+        payload = {
+            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "items": items,
+        }
+        tmp = USERCACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, USERCACHE_FILE)
+    except Exception as e:
+        # 不要因为落盘失败影响主流程
+        log(f"WARNING USERCACHE 持久化写入失败: {e}")
+
+
+def _load_usercache_from_disk():
+    if not USERCACHE_PERSIST:
+        return
+    try:
+        if not os.path.isfile(USERCACHE_FILE):
+            return
+        with open(USERCACHE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f) if f.readable() else {}
+        items = payload.get("items") or []
+        if not isinstance(items, list):
+            return
+        with USERCACHE_LOCK:
+            USERCACHE.clear()
+            for it in items:
+                try:
+                    showid = str((it or {}).get("showid") or "").strip()
+                    if not showid:
+                        continue
+                    USERCACHE[showid] = {
+                        "showid": showid,
+                        "uuid": (it or {}).get("uuid"),
+                        "strNick": (it or {}).get("strNick") or "",
+                        "strCover": (it or {}).get("strCover") or "",
+                        "cached_at": (it or {}).get("cached_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                except Exception:
+                    continue
+            # 限制最大数量（保留最新）
+            while len(USERCACHE) > USERCACHE_MAX:
+                USERCACHE.popitem(last=False)
+        log(f"INFO  USERCACHE 已从磁盘恢复: count={cache_count()}")
+    except Exception as e:
+        log(f"WARNING USERCACHE 从磁盘恢复失败: {e}")
 
 
 def cache_user(profile: dict):
@@ -423,7 +497,7 @@ def cache_user(profile: dict):
     if not showid:
         return
     with USERCACHE_LOCK:
-        # 最近使用置顶
+        # 最近使用置顶（OrderedDict：先删再插=移动到末尾）
         if showid in USERCACHE:
             del USERCACHE[showid]
         USERCACHE[showid] = {
@@ -435,22 +509,42 @@ def cache_user(profile: dict):
         }
         while len(USERCACHE) > USERCACHE_MAX:
             USERCACHE.popitem(last=False)
+    _save_usercache_to_disk()
+
+
+def delete_cached_user(showid: str) -> bool:
+    showid = str(showid or "").strip()
+    if not showid:
+        return False
+    removed = False
+    with USERCACHE_LOCK:
+        if showid in USERCACHE:
+            del USERCACHE[showid]
+            removed = True
+    if removed:
+        _save_usercache_to_disk()
+    return removed
 
 
 def list_cached_users():
     with USERCACHE_LOCK:
-        # 最新在前
+        # 最新在前（逆序）
         return list(reversed(list(USERCACHE.values())))
 
 
 def clear_user_cache():
     with USERCACHE_LOCK:
         USERCACHE.clear()
+    _save_usercache_to_disk()
 
 
 def cache_count():
     with USERCACHE_LOCK:
         return len(USERCACHE)
+
+
+# 启动时尝试恢复
+_load_usercache_from_disk()
 
 
 # =========================
@@ -1217,7 +1311,37 @@ body::after{
       display:flex;
       gap: 12px;
       align-items:center;
+      position: relative;
     }
+
+    .del-x{
+      position:absolute;
+      top: 8px;
+      left: 8px;
+      width: 26px;
+      height: 26px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,77,109,.22);
+      color: rgba(255,255,255,.92);
+      font-weight: 950;
+      cursor: pointer;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      line-height: 1;
+      z-index: 6;
+      box-shadow: 0 10px 25px rgba(0,0,0,.25), 0 0 0 5px rgba(255,77,109,.10);
+      transition: transform .08s ease, background .15s ease, border-color .15s ease;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: manipulation;
+    }
+    .del-x:hover{
+      background: rgba(255,77,109,.32);
+      border-color: rgba(255,77,109,.40);
+      transform: translateY(-1px);
+    }
+    .del-x:active{ transform: translateY(0); }
     .avatar{
       width: 54px;
       height: 54px;
@@ -1323,7 +1447,7 @@ body::after{
     .toast-wrap{
       position: fixed;
       left: 50%;
-      top: 30%;
+      top: 10%;
       transform: translate(-50%, -50%);
       z-index: 9999;
       display: flex;
@@ -1786,6 +1910,7 @@ function renderPlayerCard(p, {showSelect=true, showUnlock=true}={}){
 
  return `
   <div class="player-card">
+    ${p.cached_at ? `<button type="button" class="del-x" title="删除缓存" onclick="event.stopPropagation(); deleteCached('${showid}')">×</button>` : ``}
     <div class="avatar">${cover ? `<img src="${cover}" />` : ''}</div>
     <div class="p-meta">
       <div class="p-nick">${nick}</div>
@@ -1973,12 +2098,30 @@ async function refreshUserCache(){
   const j = await r.json();
   const list = j.items || [];
   const box = document.getElementById('cacheList');
+
   if(list.length === 0){
+    // 1) 先尝试用 localStorage 的历史缓存回灌（跨部署/重启仍可恢复）
+    box.innerHTML = `<div class="hint">缓存为空，正在尝试从浏览器本地恢复...</div>`;
+    const did = await rehydrateCacheFromLocal();
+    if(did){
+      const r2 = await fetch('/api/user_cache?t=' + Date.now(), { cache: 'no-store' });
+      const j2 = await r2.json();
+      const list2 = j2.items || [];
+      if(list2.length > 0){
+        try{ localStorage.setItem('cached_showids', JSON.stringify(list2.map(x=>String(x.showid)))); }catch(e){}
+        box.innerHTML = list2.map(p => renderPlayerCard(p, {showSelect:true, showUnlock:true})).join('');
+        return;
+      }
+    }
+
+    // 2) 仍为空：自动缓存默认用户（保证永远至少有一个）
     box.innerHTML = `<div class="hint">暂无缓存，正在自动缓存默认用户 <b>${DEFAULT_SHOWID}</b> ...</div>`;
     await ensureDefaultCached();
-    // ensureDefaultCached will refresh list on success; if still empty, keep hint
     return;
   }
+
+  // 写回 localStorage（用于跨部署恢复）
+  try{ localStorage.setItem('cached_showids', JSON.stringify(list.map(x=>String(x.showid)))); }catch(e){}
   box.innerHTML = list.map(p => renderPlayerCard(p, {showSelect:true, showUnlock:true})).join('');
 }
 
@@ -1992,6 +2135,68 @@ async function clearUserCache(){
 function selectCached(showid){
   document.getElementById('showidUnlock').value = showid;
   showToast({ type:'success', title:'已选择', msg:`已填入解封 showid=${escapeHtml(showid)}`, duration: 1600 });
+}
+
+async function deleteCached(showid){
+  if(!showid) return;
+
+  // 先乐观更新：从 localStorage 里移除
+  try{
+    const raw = localStorage.getItem('cached_showids');
+    const arr = raw ? JSON.parse(raw) : [];
+    const next = (Array.isArray(arr) ? arr : []).filter(x => String(x) !== String(showid));
+    localStorage.setItem('cached_showids', JSON.stringify(next));
+  }catch(e){}
+
+  const form = new URLSearchParams();
+  form.append('showid', showid);
+
+  try{
+    const r = await fetch('/api/user_cache/delete', {
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+      body: form.toString()
+    });
+    const j = await r.json();
+    if(j && j.ok){
+      showToast({ type:'success', title:'已删除', msg:`已删除缓存 showid=${escapeHtml(showid)}`, duration: 1600 });
+    }else{
+      showToast({ type:'warn', title:'未删除', msg:`缓存中可能已不存在 showid=${escapeHtml(showid)}`, duration: 2200 });
+    }
+  }catch(e){
+    showToast({ type:'error', title:'删除失败', msg: escapeHtml(e?.message || String(e)), duration: 3600 });
+  }
+
+  await refreshUserCache();
+  await refreshStatus();
+}
+
+async function rehydrateCacheFromLocal(){
+  // 后端缓存为空时：用浏览器 localStorage 的 showid 列表回灌（跨部署/重启仍能恢复）
+  let ids = [];
+  try{
+    const raw = localStorage.getItem('cached_showids');
+    const arr = raw ? JSON.parse(raw) : [];
+    ids = Array.isArray(arr) ? arr.map(x => String(x).trim()).filter(Boolean) : [];
+  }catch(e){
+    ids = [];
+  }
+  if(ids.length === 0) return false;
+
+  for(const sid of ids){
+    const form = new URLSearchParams();
+    form.append('showid', sid);
+    try{
+      const r = await fetch('/api/user_lookup', {
+        method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},
+        body: form.toString()
+      });
+      const j = await r.json();
+      if(!(j && j.ok)){}
+    }catch(e){}
+  }
+  return true;
 }
 
 function normalizeResponseToObj(resp){
@@ -2436,6 +2641,17 @@ def api_user_cache_clear():
     clear_user_cache()
     log("INFO  玩家资料缓存已清空（用户操作）")
     return jsonify({"ok": True})
+
+
+@app.post("/api/user_cache/delete")
+def api_user_cache_delete():
+    showid = (request.form.get("showid") or "").strip()
+    if not showid:
+        return jsonify({"ok": False, "msg": "showid required"}), 400
+    ok = delete_cached_user(showid)
+    if ok:
+        log(f"INFO  已删除缓存玩家: showid={showid}（剩余 {cache_count()}）")
+    return jsonify({"ok": ok})
 
 
 # =========================
